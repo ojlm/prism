@@ -8,10 +8,18 @@ repository = "https://github.com/asura-pro/prism"
 documentation = "https://docs.rs/prism"
 keywords = ["prism"]
 
+[lib]
+name = "prism"
+
+[[bin]]
+name = "prism"
+path = "src/bin/prism.rs"
+
 [dependencies]
 log = "0.4"
 env_logger = "0.6"
 futures = "0.1"
+time = "0.1"
 tokio-io = "0.1"
 tokio = "0.1"
 trust-dns = { version = "0.9.2", default-features = false }
