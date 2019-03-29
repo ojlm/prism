@@ -3,7 +3,7 @@ use std::{
   io::{self, Write},
 };
 
-use env_logger::{Builder, fmt::Formatter};
+use env_logger::{fmt::Formatter, Builder};
 use log::{LevelFilter, Record};
 
 pub fn init(without_time: bool, debug_level: u64, bin_name: &str) {
