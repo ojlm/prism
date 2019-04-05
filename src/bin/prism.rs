@@ -15,11 +15,11 @@ use std::rc::Rc;
 use std::str;
 use std::time::Duration;
 
-use futures::{Async, Future, Poll, Stream};
 use futures::future;
+use futures::{Async, Future, Poll, Stream};
 use tokio_core::net::{TcpListener, TcpStream};
 use tokio_core::reactor::{Core, Handle, Timeout};
-use tokio_io::io::{read_exact, Window, write_all};
+use tokio_io::io::{read_exact, write_all, Window};
 use trust_dns::client::{BasicClientHandle, ClientFuture, ClientHandle};
 use trust_dns::op::{Message, ResponseCode};
 use trust_dns::rr::{DNSClass, Name, RData, RecordType};
@@ -44,22 +44,22 @@ fn main() {
 
   info!("listening for socks5 proxy connections on: {}", addr);
   let clients = listener.incoming().map(move |(socket, addr)| {
-    (Client {
-      buffer: buffer.clone(),
-      dns: client.clone(),
-      handle: handler.clone(),
-    }.serve(socket), addr)
+    (
+      Client {
+        buffer: buffer.clone(),
+        dns: client.clone(),
+        handle: handler.clone(),
+      }
+      .serve(socket),
+      addr,
+    )
   });
   let handle = lp.handle();
   let server = clients.for_each(|(client, addr)| {
     handle.spawn(client.then(move |res| {
       match res {
-        Ok((a, b)) => {
-          info!("proxied {}/{} bytes for {}", a, b, addr)
-        }
-        Err(e) => {
-          error!("error for {}: {}", addr, e)
-        }
+        Ok((a, b)) => info!("proxied {}/{} bytes for {}", a, b, addr),
+        Err(e) => error!("error for {}: {}", addr, e),
       }
       future::ok(())
     }));
@@ -76,38 +76,34 @@ struct Client {
 }
 
 impl Client {
-  fn serve(self, conn: TcpStream) -> Box<Future<Item=(u64, u64), Error=io::Error>> {
-    Box::new(read_exact(conn, [0u8]).and_then(|(conn, buf)| {
-      match buf[0] {
-        socks5::VERSION => self.serve_v5(conn),
-        socks4::VERSION => self.serve_v4(conn),
-        _ => future::err(other("unknown version")).boxed(),
-      }
+  fn serve(self, conn: TcpStream) -> Box<Future<Item = (u64, u64), Error = io::Error>> {
+    Box::new(read_exact(conn, [0u8]).and_then(|(conn, buf)| match buf[0] {
+      socks5::VERSION => self.serve_v5(conn),
+      socks4::VERSION => self.serve_v4(conn),
+      _ => Box::new(future::err(other("unknown version"))),
     }))
   }
 
-  fn serve_v4(self, _conn: TcpStream) -> Box<Future<Item=(u64, u64), Error=io::Error>> {
-    future::err(other("unimplemented")).boxed()
+  fn serve_v4(self, _conn: TcpStream) -> Box<Future<Item = (u64, u64), Error = io::Error>> {
+    Box::new(future::err(other("unimplemented")))
   }
 
   // https://tools.ietf.org/html/rfc1928
-  fn serve_v5(self, conn: TcpStream) -> Box<Future<Item=(u64, u64), Error=io::Error>> {
+  fn serve_v5(self, conn: TcpStream) -> Box<Future<Item = (u64, u64), Error = io::Error>> {
     // Negotiation for which authentication method will be used
     let num_methods = read_exact(conn, [0u8]);
-    let authenticated = num_methods.and_then(|(conn, buf)| {
-      read_exact(conn, vec![0u8; buf[0] as usize])
-    }).and_then(|(conn, buf)| {
-      if buf.contains(&socks5::METHOD_NO_AUTH) {
-        Ok(conn)
-      } else {
-        Err(other("no supported method given"))
-      }
-    }).boxed();
+    let authenticated = num_methods
+      .and_then(|(conn, buf)| read_exact(conn, vec![0u8; buf[0] as usize]))
+      .and_then(|(conn, buf)| {
+        if buf.contains(&socks5::METHOD_NO_AUTH) {
+          Ok(conn)
+        } else {
+          Err(other("no supported method given"))
+        }
+      });
 
     // Sends a METHOD selection message
-    let part1 = authenticated.and_then(|conn| {
-      write_all(conn, [socks5::VERSION, socks5::METHOD_NO_AUTH])
-    }).boxed();
+    let part1 = authenticated.and_then(|conn| write_all(conn, [socks5::VERSION, socks5::METHOD_NO_AUTH]));
 
     // Request details
     let ack = part1.and_then(|(conn, _)| {
@@ -118,7 +114,7 @@ impl Client {
           Err(other("didn't confirm with v5 version"))
         }
       })
-    }).boxed();
+    });
 
     let command = ack.and_then(|conn| {
       read_exact(conn, [0u8]).and_then(|(conn, buf)| {
@@ -128,56 +124,53 @@ impl Client {
           Err(other("unsupported command"))
         }
       })
-    }).boxed();
+    });
 
     let mut dns = self.dns.clone();
     let rsv = command.and_then(|c| read_exact(c, [0u8]).map(|c| c.0));
     let atyp = rsv.and_then(|c| read_exact(c, [0u8]));
     let addr = my_box(atyp.and_then(move |(c, buf)| {
       match buf[0] {
-        socks5::ATYP_IPV4 => {
-          my_box(read_exact(c, [0u8; 6]).map(|(c, buf)| {
-            let addr = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
-            let port = ((buf[4] as u16) << 8) | (buf[5] as u16);
-            let addr = SocketAddrV4::new(addr, port);
-            (c, SocketAddr::V4(addr))
-          }))
-        }
-        socks5::ATYP_IPV6 => {
-          my_box(read_exact(c, [0u8; 18]).map(|(conn, buf)| {
-            let a = ((buf[0] as u16) << 8) | (buf[1] as u16);
-            let b = ((buf[2] as u16) << 8) | (buf[3] as u16);
-            let c = ((buf[4] as u16) << 8) | (buf[5] as u16);
-            let d = ((buf[6] as u16) << 8) | (buf[7] as u16);
-            let e = ((buf[8] as u16) << 8) | (buf[9] as u16);
-            let f = ((buf[10] as u16) << 8) | (buf[11] as u16);
-            let g = ((buf[12] as u16) << 8) | (buf[13] as u16);
-            let h = ((buf[14] as u16) << 8) | (buf[15] as u16);
-            let addr = Ipv6Addr::new(a, b, c, d, e, f, g, h);
-            let port = ((buf[16] as u16) << 8) | (buf[17] as u16);
-            let addr = SocketAddrV6::new(addr, port, 0, 0);
-            (conn, SocketAddr::V6(addr))
-          }))
-        }
-        socks5::ATYP_DOMAIN => {
-          my_box(read_exact(c, [0u8]).and_then(|(conn, buf)| {
-            read_exact(conn, vec![0u8; buf[0] as usize + 2])
-          }).and_then(move |(conn, buf)| {
-            let (name, port) = match name_port(&buf) {
-              Ok(UrlHost::Name(name, port)) => (name, port),
-              Ok(UrlHost::Addr(addr)) => {
-                return my_box(future::ok((conn, addr)));
-              }
-              Err(e) => return my_box(future::err(e))
-            };
+        socks5::ATYP_IPV4 => my_box(read_exact(c, [0u8; 6]).map(|(c, buf)| {
+          let addr = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
+          let port = ((buf[4] as u16) << 8) | (buf[5] as u16);
+          let addr = SocketAddrV4::new(addr, port);
+          (c, SocketAddr::V4(addr))
+        })),
+        socks5::ATYP_IPV6 => my_box(read_exact(c, [0u8; 18]).map(|(conn, buf)| {
+          let a = ((buf[0] as u16) << 8) | (buf[1] as u16);
+          let b = ((buf[2] as u16) << 8) | (buf[3] as u16);
+          let c = ((buf[4] as u16) << 8) | (buf[5] as u16);
+          let d = ((buf[6] as u16) << 8) | (buf[7] as u16);
+          let e = ((buf[8] as u16) << 8) | (buf[9] as u16);
+          let f = ((buf[10] as u16) << 8) | (buf[11] as u16);
+          let g = ((buf[12] as u16) << 8) | (buf[13] as u16);
+          let h = ((buf[14] as u16) << 8) | (buf[15] as u16);
+          let addr = Ipv6Addr::new(a, b, c, d, e, f, g, h);
+          let port = ((buf[16] as u16) << 8) | (buf[17] as u16);
+          let addr = SocketAddrV6::new(addr, port, 0, 0);
+          (conn, SocketAddr::V6(addr))
+        })),
+        socks5::ATYP_DOMAIN => my_box(
+          read_exact(c, [0u8])
+            .and_then(|(conn, buf)| read_exact(conn, vec![0u8; buf[0] as usize + 2]))
+            .and_then(move |(conn, buf)| {
+              let (name, port) = match name_port(&buf) {
+                Ok(UrlHost::Name(name, port)) => (name, port),
+                Ok(UrlHost::Addr(addr)) => {
+                  return my_box(future::ok((conn, addr)));
+                }
+                Err(e) => return my_box(future::err(e)),
+              };
 
-            let ipv4 = dns.query(name, DNSClass::IN, RecordType::A)
-              .map_err(|e| other(&format!("dns error: {}", e)))
-              .and_then(move |r| get_addr(r, port));
+              let ipv4 = dns
+                .query(name, DNSClass::IN, RecordType::A)
+                .map_err(|e| other(&format!("dns error: {}", e)))
+                .and_then(move |r| get_addr(r, port));
 
-            my_box(ipv4.map(|addr| (conn, addr)))
-          }))
-        }
+              my_box(ipv4.map(|addr| (conn, addr)))
+            }),
+        ),
         n => {
           let msg = format!("unknown ATYP received: {}", n);
           my_box(future::err(other(&msg)))
@@ -222,7 +215,7 @@ impl Client {
       // ATYP, BND.ADDR, and BND.PORT
       let addr = match c2.as_ref().map(|r| r.local_addr()) {
         Ok(Ok(addr)) => addr,
-        Ok(Err(..)) | Err(..) => addr
+        Ok(Err(..)) | Err(..) => addr,
       };
       let pos = match addr {
         SocketAddr::V4(ref a) => {
@@ -246,20 +239,14 @@ impl Client {
 
       let mut w = Window::new(resp);
       w.set_end(pos + 2);
-      write_all(c1, w).and_then(|(c1, _)| {
-        c2.map(|c2| (c1, c2))
-      })
+      write_all(c1, w).and_then(|(c1, _)| c2.map(|c2| (c1, c2)))
     }));
 
     let timeout = Timeout::new(Duration::new(10, 0), &self.handle).unwrap();
-    let pair = my_box(handshake_finish.map(Ok).select(timeout.map(Err)).then(|res| {
-      match res {
-        Ok((Ok(pair), _timeout)) => Ok(pair),
-        Ok((Err(()), _handshake)) => {
-          Err(other("timeout during handshake"))
-        }
-        Err((e, _other)) => Err(e),
-      }
+    let pair = my_box(handshake_finish.map(Ok).select(timeout.map(Err)).then(|res| match res {
+      Ok((Ok(pair), _timeout)) => Ok(pair),
+      Ok((Err(()), _handshake)) => Err(other("timeout during handshake")),
+      Err((e, _other)) => Err(e),
     }));
 
     let buffer = self.buffer.clone();
@@ -274,7 +261,7 @@ impl Client {
   }
 }
 
-fn my_box<F: Future + 'static>(f: F) -> Box<Future<Item=F::Item, Error=F::Error>> {
+fn my_box<F: Future + 'static>(f: F) -> Box<Future<Item = F::Item, Error = F::Error>> {
   Box::new(f)
 }
 
@@ -288,10 +275,7 @@ struct Transfer {
 }
 
 impl Transfer {
-  fn new(
-    reader: Rc<TcpStream>,
-    writer: Rc<TcpStream>,
-    buffer: Rc<RefCell<Vec<u8>>>) -> Transfer {
+  fn new(reader: Rc<TcpStream>, writer: Rc<TcpStream>, buffer: Rc<RefCell<Vec<u8>>>) -> Transfer {
     Transfer {
       reader,
       writer,
@@ -317,12 +301,12 @@ impl Future for Transfer {
 
       let n = try_nb!((&*self.reader).read(&mut buffer));
       if n == 0 {
-        try!(self.writer.shutdown(Shutdown::Write));
+        self.writer.shutdown(Shutdown::Write)?;
         return Ok(self.amt.into());
       }
       self.amt += n as u64;
 
-      let m = try!((&*self.writer).write(&buffer[..n]));
+      let m = (&*self.writer).write(&buffer[..n])?;
       assert_eq!(n, m);
     }
   }
@@ -339,18 +323,15 @@ enum UrlHost {
 
 fn name_port(addr_buf: &[u8]) -> io::Result<UrlHost> {
   let hostname = &addr_buf[..addr_buf.len() - 2];
-  let hostname = str::from_utf8(hostname).map_err(|_e| {
-    other("hostname buffer provided was not valid utf-8")
-  })?;
+  let hostname = str::from_utf8(hostname).map_err(|_e| other("hostname buffer provided was not valid utf-8"))?;
   let pos = addr_buf.len() - 2;
   let port = ((addr_buf[pos] as u16) << 8) | (addr_buf[pos + 1] as u16);
 
   if let Ok(ip) = hostname.parse() {
     return Ok(UrlHost::Addr(SocketAddr::new(ip, port)));
   }
-  let name = Name::parse(hostname, Some(&Name::root())).map_err(|e| {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
-  })?;
+  let name =
+    Name::parse(hostname, Some(&Name::root())).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
   Ok(UrlHost::Name(name, port))
 }
@@ -360,13 +341,15 @@ fn get_addr(response: Message, port: u16) -> io::Result<SocketAddr> {
   if response.get_response_code() != ResponseCode::NoError {
     return Err(other("resolution failed"));
   }
-  let addr = response.get_answers().iter().filter_map(|ans| {
-    match *ans.get_rdata() {
+  let addr = response
+    .get_answers()
+    .iter()
+    .filter_map(|ans| match *ans.get_rdata() {
       RData::A(addr) => Some(IpAddr::V4(addr)),
       RData::AAAA(addr) => Some(IpAddr::V6(addr)),
       _ => None,
-    }
-  }).next();
+    })
+    .next();
   match addr {
     Some(addr) => Ok(SocketAddr::new(addr, port)),
     None => Err(other("no address records in response")),
